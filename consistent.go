@@ -18,12 +18,11 @@
 //
 // Read more about consistent hashing on wikipedia:  http://en.wikipedia.org/wiki/Consistent_hashing
 //
-package consistent // import "stathat.com/c/consistent"
+package stathat // import "stathat.com/c/consistent"
 
 import (
 	"errors"
-	"hash/crc32"
-	"hash/fnv"
+	"github.com/cespare/xxhash/v2"
 	"sort"
 	"strconv"
 	"sync"
@@ -45,13 +44,12 @@ var ErrEmptyCircle = errors.New("empty circle")
 
 // Consistent holds the information about the members of the consistent hash circle.
 type Consistent struct {
-	circle           map[uint32]string
-	members          map[string]bool
-	sortedHashes     uints
-	NumberOfReplicas int
-	count            int64
-	scratch          [64]byte
-	UseFnv           bool
+	circle              map[uint32]string
+	members             map[string]int
+	sortedHashes        uints
+	MaxNumberOfReplicas int
+	count               int64
+	scratch             [64]byte
 	sync.RWMutex
 }
 
@@ -60,9 +58,9 @@ type Consistent struct {
 // To change the number of replicas, set NumberOfReplicas before adding entries.
 func New() *Consistent {
 	c := new(Consistent)
-	c.NumberOfReplicas = 20
+	c.MaxNumberOfReplicas = 1
 	c.circle = make(map[uint32]string)
-	c.members = make(map[string]bool)
+	c.members = make(map[string]int)
 	return c
 }
 
@@ -73,18 +71,21 @@ func (c *Consistent) eltKey(elt string, idx int) string {
 }
 
 // Add inserts a string element in the consistent hash.
-func (c *Consistent) Add(elt string) {
+func (c *Consistent) Add(elt string, replica int) {
 	c.Lock()
 	defer c.Unlock()
-	c.add(elt)
+	if c.MaxNumberOfReplicas < replica {
+		c.MaxNumberOfReplicas = replica
+	}
+	c.add(elt, replica)
 }
 
 // need c.Lock() before calling
-func (c *Consistent) add(elt string) {
-	for i := 0; i < c.NumberOfReplicas; i++ {
+func (c *Consistent) add(elt string, replica int) {
+	for i := 0; i < replica; i++ {
 		c.circle[c.hashKey(c.eltKey(elt, i))] = elt
 	}
-	c.members[elt] = true
+	c.members[elt] = replica
 	c.updateSortedHashes()
 	c.count++
 }
@@ -98,7 +99,8 @@ func (c *Consistent) Remove(elt string) {
 
 // need c.Lock() before calling
 func (c *Consistent) remove(elt string) {
-	for i := 0; i < c.NumberOfReplicas; i++ {
+	cnt := c.members[elt]
+	for i := 0; i < cnt; i++ {
 		delete(c.circle, c.hashKey(c.eltKey(elt, i)))
 	}
 	delete(c.members, elt)
@@ -124,11 +126,11 @@ func (c *Consistent) Set(elts []string) {
 		}
 	}
 	for _, v := range elts {
-		_, exists := c.members[v]
+		cnt, exists := c.members[v]
 		if exists {
 			continue
 		}
-		c.add(v)
+		c.add(v, cnt)
 	}
 }
 
@@ -238,31 +240,19 @@ func (c *Consistent) GetN(name string, n int) ([]string, error) {
 }
 
 func (c *Consistent) hashKey(key string) uint32 {
-	if c.UseFnv {
-		return c.hashKeyFnv(key)
-	}
-	return c.hashKeyCRC32(key)
-}
-
-func (c *Consistent) hashKeyCRC32(key string) uint32 {
-	if len(key) < 64 {
-		var scratch [64]byte
-		copy(scratch[:], key)
-		return crc32.ChecksumIEEE(scratch[:len(key)])
-	}
-	return crc32.ChecksumIEEE([]byte(key))
-}
-
-func (c *Consistent) hashKeyFnv(key string) uint32 {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return h.Sum32()
+	//if len(key) < 64 {
+	//	var scratch [64]byte
+	//	copy(scratch[:], key)
+	//	return crc32.ChecksumIEEE(scratch[:len(key)])
+	//}
+	//return crc32.ChecksumIEEE([]byte(key))
+	return uint32(xxhash.Sum64String(key))
 }
 
 func (c *Consistent) updateSortedHashes() {
 	hashes := c.sortedHashes[:0]
 	//reallocate if we're holding on to too much (1/4th)
-	if cap(c.sortedHashes)/(c.NumberOfReplicas*4) > len(c.circle) {
+	if cap(c.sortedHashes)/(c.MaxNumberOfReplicas*4) > len(c.circle) {
 		hashes = nil
 	}
 	for k := range c.circle {
